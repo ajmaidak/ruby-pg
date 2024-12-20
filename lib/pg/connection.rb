@@ -676,43 +676,35 @@ class PG::Connection
 	module Pollable
 		# Track the progress of the connection, waiting for the socket to become readable/writable before polling it
 		private def polling_loop(poll_meth, connect_timeout)
-			if (timeo = connect_timeout.to_i) && timeo > 0
-				host_count = conninfo_hash[:host].to_s.count(",") + 1
-				stop_time = timeo * host_count + Process.clock_gettime(Process::CLOCK_MONOTONIC)
-			end
-
+			# pass nil to the selector to wait forever if we have no connect_timeout
+			per_host_connect_timeout = connect_timeout.to_i if connect_timeout.to_i > 0
+			host_count = conninfo_hash[:host].to_s.count(",") + 1
 			poll_status = PG::PGRES_POLLING_WRITING
-			until poll_status == PG::PGRES_POLLING_OK ||
-					poll_status == PG::PGRES_POLLING_FAILED
 
-				# Set single timeout to parameter "connect_timeout" but
-				# don't exceed total connection time of number-of-hosts * connect_timeout.
-				timeout = [timeo, stop_time - Process.clock_gettime(Process::CLOCK_MONOTONIC)].min if stop_time
-				event = if !timeout || timeout >= 0
-					# If the socket needs to read, wait 'til it becomes readable to poll again
-					case poll_status
-					when PG::PGRES_POLLING_READING
-						if defined?(IO::READABLE) # ruby-3.0+
-							socket_io.wait(IO::READABLE | IO::PRIORITY, timeout)
-						else
-							IO.select([socket_io], nil, [socket_io], timeout)
-						end
+			until poll_status == PG::PGRES_POLLING_OK || poll_status == PG::PGRES_POLLING_FAILED
+				# If the socket needs to read, wait 'til it becomes readable to poll again
+				case poll_status
+				when PG::PGRES_POLLING_READING
+					if defined?(IO::READABLE) # ruby-3.0+
+						event = socket_io.wait(IO::READABLE | IO::PRIORITY, per_host_connect_timeout)
+					else
+						event = IO.select([socket_io], nil, [socket_io], per_host_connect_timeout)
+					end
 
-					# ...and the same for when the socket needs to write
-					when PG::PGRES_POLLING_WRITING
-						if defined?(IO::WRITABLE) # ruby-3.0+
-							# Use wait instead of wait_readable, since connection errors are delivered as
-							# exceptional/priority events on Windows.
-							socket_io.wait(IO::WRITABLE | IO::PRIORITY, timeout)
-						else
-							# io#wait on ruby-2.x doesn't wait for priority, so fallback to IO.select
-							IO.select(nil, [socket_io], [socket_io], timeout)
-						end
+				when PG::PGRES_POLLING_WRITING
+					if defined?(IO::WRITABLE) # ruby-3.0+
+						# Use wait instead of wait_readable, since connection errors are delivered as
+						# exceptional/priority events on Windows.
+						event = socket_io.wait(IO::WRITABLE | IO::PRIORITY, per_host_connect_timeout)
+					else
+						# io#wait on ruby-2.x doesn't wait for priority, so fallback to IO.select
+						event = IO.select(nil, [socket_io], [socket_io], per_host_connect_timeout)
 					end
 				end
+
 				# connection to server at "localhost" (127.0.0.1), port 5433 failed: timeout expired (PG::ConnectionBad)
 				# connection to server on socket "/var/run/postgresql/.s.PGSQL.5433" failed: No such file or directory
-				unless event
+				if event.nil?
 					if self.class.send(:host_is_named_pipe?, host)
 						connhost = "on socket \"#{host}\""
 					elsif respond_to?(:hostaddr)
@@ -720,11 +712,21 @@ class PG::Connection
 					else
 						connhost = "at \"#{host}\", port #{port}"
 					end
-					raise PG::ConnectionBad.new("connection to server #{connhost} failed: timeout expired", connection: self)
+
+					host_count -= 1
+					if host_count > 0
+						$stderr.puts "connection to server #{connhost} failed: timeout expired, trying next host"
+						send(:sync_reset)
+					else
+						raise PG::ConnectionBad.new(
+							"connection to server #{connhost} failed: timeout expired",
+							connection: self
+						)
+					end
 				end
 
 				# Check to see if it's finished or failed yet
-				poll_status = send( poll_meth )
+				poll_status = send(poll_meth)
 			end
 
 			unless status == PG::CONNECTION_OK
